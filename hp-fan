@@ -1,0 +1,260 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+import argparse
+import errno
+import fcntl
+import os
+from pathlib import Path
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+
+ROOT = Path(__file__).resolve().parent
+PARAMS = Path('/sys/module/hp_envy_fan/parameters')
+MODULE = ROOT / 'kernel/hp_envy_fan.ko'
+LOCK = Path('/run/lock/hp-envy-fan.lock')
+SYS = Path('/sys')
+PRESETS = {'cool': (4800, 4500), 'max': (6000, 5800)}
+STATE_KEYS = {'abi', 'active', 'stopping', 'cpu', 'gpu', 'error', 'restore_error', 'owner',
+              'pulses', 'reason'}
+
+class FanError(Exception):
+    pass
+
+def run(*args):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        raise FanError(f'{args[0]} timed out; do not force-unload an active module') from exc
+    if result.returncode:
+        raise FanError(result.stderr.strip() or f'{args[0]} failed ({result.returncode})')
+    return result.stdout
+
+def parse_state(text):
+    try:
+        pairs = [item.split('=', 1) for item in text.split()]
+        if len(pairs) != len(STATE_KEYS):
+            raise ValueError
+        raw = dict(pairs)
+        if set(raw) != STATE_KEYS:
+            raise ValueError
+        state = {key: int(value, 16 if key == 'owner' else 10)
+                 for key, value in raw.items() if key != 'reason'}
+        if raw['reason'] not in ('none', 'sensor', 'temperature', 'watchdog', 'firmware',
+                                 'manual', 'activation', 'suspend', 'shutdown'):
+            raise ValueError
+        state['reason'] = raw['reason']
+        if state['abi'] != 2 or state['active'] not in (0, 1) or state['stopping'] not in (0, 1):
+            raise ValueError
+        if not 0 <= state['owner'] <= 2**64 - 1:
+            raise ValueError
+        return state
+    except (ValueError, TypeError) as exc:
+        raise FanError('Unsupported or malformed module state; refusing hardware changes') from exc
+
+def state():
+    return parse_state((PARAMS / 'state').read_text())
+
+def control(command, token=None):
+    text = command if token is None else f'{command} {token:x}'
+    payload = (text + '\n').encode('ascii')
+
+    fd = os.open(PARAMS / 'control', os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        if os.write(fd, payload) != len(payload):
+            raise FanError('Incomplete kernel control command')
+    finally:
+        os.close(fd)
+
+def readings():
+    fans = sorted((SYS / 'devices/platform/hp-wmi/hwmon').glob('hwmon*/fan[12]_input'))
+    if len(fans) != 2:
+        raise FanError('Expected exactly two native HP fan sensors')
+    rpms = tuple(int(p.read_text()) for p in fans)
+    temps = [int((p.parent / 'temp1_input').read_text()) / 1000
+             for p in (SYS / 'class/hwmon').glob('hwmon*/name')
+             if p.read_text().strip() == 'coretemp']
+    if len(temps) != 1 or not 0 <= temps[0] < 125 or any(r < 0 or r > 15000 for r in rpms):
+        raise FanError('Missing or implausible fan/CPU temperature readings')
+    return rpms, temps[0]
+
+def display(sample):
+    rpms, temperature = sample
+    print(f'Fans: {rpms[0]} / {rpms[1]} RPM | CPU: {temperature:.0f} C', flush=True)
+
+def service_active(name):
+    result = subprocess.run(['/usr/bin/systemctl', 'is-active', name],
+                            capture_output=True, text=True, timeout=5)
+    if result.returncode == 0 and result.stdout.strip() == 'active':
+        return True
+    if result.returncode in (3, 4) and result.stdout.strip() in ('inactive', 'failed', 'unknown'):
+        return False
+    raise FanError(f'Cannot verify whether {name} is active; refusing to start')
+
+def preflight():
+    expected = {'sys_vendor': 'HP', 'product_name': 'HP ENVY Laptop 14-eb0xxx',
+                'board_name': '8815', 'bios_version': 'F.46'}
+    for key, value in expected.items():
+        if (SYS / 'class/dmi/id' / key).read_text().strip() != value:
+            raise FanError('This exact laptop/BIOS combination has not been verified')
+    for name in ('nbfc_service', 'fancontrol'):
+        if service_active(name):
+            raise FanError(f'{name} is active; fan controllers must not compete')
+    if service_active('coolercontrold'):
+        try:
+            config = tomllib.loads(Path('/etc/coolercontrol/config.toml').read_text())
+            hp_ids = [uid for uid, name in config.get('devices', {}).items() if name == 'hp']
+            if not hp_ids or any(config.get('device-settings', {}).get(uid) for uid in hp_ids):
+                raise ValueError('HP fan configuration is managed or unknown')
+        except (OSError, ValueError) as exc:
+            raise FanError('CoolerControl must leave the HP device unmanaged') from exc
+    for name in ('hp_fan_trial', 'hp_fan_direct'):
+        if (SYS / 'module' / name).exists():
+            raise FanError('A diagnostic fan experiment is still running')
+    controls = list((SYS / 'devices/platform/hp-wmi/hwmon').glob('hwmon*/pwm1_enable'))
+    if len(controls) != 1 or controls[0].read_text().strip() != '2':
+        raise FanError('Native HP driver must start in automatic mode')
+    sample = readings()
+    if sample[1] >= 80:
+        raise FanError('CPU is already at or above 80 C; leave firmware automatic control active')
+    return sample
+
+def acquire_lock():
+    fd = os.open(LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != 0 or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise FanError('Unsafe controller lock file')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+def ensure_module():
+    if not PARAMS.exists():
+        if not MODULE.is_file():
+            raise FanError('Build the module first with make module')
+        version = run('/usr/sbin/modinfo', '-F', 'vermagic', str(MODULE)).split()[0]
+        if version != os.uname().release:
+            raise FanError('Kernel changed; rebuild with make module before using this command')
+        run('/usr/sbin/insmod', str(MODULE))
+    current = state()
+    if current['active']:
+        raise FanError('A fan override is already active; stop it before starting another')
+    if current['restore_error']:
+        raise FanError('A previous restoration needs attention; refusing another override')
+
+def restore(token=None):
+    if not PARAMS.exists():
+        return False
+    current = state()
+    if token is not None and current['owner'] != token:
+        return False
+    control('auto', token)
+    current = state()
+    if current['active'] or current['restore_error']:
+        raise FanError('Restoration not verified. Module remains loaded and retries; do not force-unload it.')
+
+    run('/usr/sbin/rmmod', 'hp_envy_fan')
+    if PARAMS.exists():
+        raise FanError('Module removal could not be verified')
+    return True
+
+def interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+def session(mode, seconds):
+    lock = acquire_lock()
+    token = secrets.randbits(64) or 1
+    attempted = False
+    try:
+        display(preflight())
+        ensure_module()
+        attempted = True
+        control(mode, token)
+        current = state()
+        if not current['active'] or current['owner'] != token:
+            raise FanError('Fan activation was not confirmed')
+        print(f'{mode}: targets {PRESETS[mode][0]} / {PRESETS[mode][1]} RPM. '
+              'Ctrl+C restores automatic control.', flush=True)
+        started = time.monotonic()
+        while seconds is None or time.monotonic() - started < seconds:
+            current = state()
+            if not current['active']:
+                if current['restore_error']:
+                    raise FanError('Firmware restoration failed; kernel retry is still active')
+                print(f'Override ended ({current["reason"]}); automatic targets were verified by the kernel.', flush=True)
+                break
+            if current['owner'] != token:
+                raise FanError('Session ownership changed; refusing further control')
+            sample = readings()
+            display(sample)
+            if sample[1] >= 80:
+                print('CPU reached 80 C; returning to firmware control.', flush=True)
+                break
+            if min(sample[0]) < 500:
+                raise FanError('A fan reading fell below 500 RPM; returning to firmware control')
+            if time.monotonic() - started >= 12:
+                if any(abs(actual - target) > target * 0.2
+                       for actual, target in zip(sample[0], PRESETS[mode])):
+                    raise FanError('Actual fan speeds did not follow the requested targets')
+            try:
+                control('heartbeat', token)
+            except OSError as exc:
+                stopped = state()
+                if exc.errno in (errno.ETIME, errno.ESHUTDOWN) and not stopped['active']:
+                    print(f'Override ended ({stopped["reason"]}); automatic targets verified.', flush=True)
+                    break
+                raise
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            if attempted and restore(token):
+                print('Original automatic fan targets verified; module unloaded.', flush=True)
+        finally:
+            os.close(lock)
+
+def main():
+    parser = argparse.ArgumentParser(description="HP Envy 14 fan control (experimental).")
+    parser.add_argument('mode', choices=['status', 'cool', 'max', 'auto'])
+    parser.add_argument('--seconds', type=int)
+    args = parser.parse_args()
+    if args.seconds is not None and (args.mode not in PRESETS or args.seconds <= 0):
+        parser.error('--seconds requires cool/max and a positive duration')
+    if args.mode == 'status':
+        display(readings())
+        if PARAMS.exists():
+            current = state()
+            print(f'Controller active={current["active"]} targets={current["cpu"]}/{current["gpu"]} '
+                  f'restore_error={current["restore_error"]}')
+        else:
+            print('This tool is inactive.')
+        return
+    if os.geteuid() != 0:
+        os.execv('/usr/bin/sudo', ['sudo', '/usr/bin/python3', '-I', '-u',
+                                  str(Path(__file__).resolve()), *sys.argv[1:]])
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupt)
+    if args.mode == 'auto':
+        if restore():
+            print('Original automatic fan targets verified; module unloaded.')
+        else:
+            print('This tool has no loaded module.')
+        return
+    session(args.mode, args.seconds)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (FanError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f'hp-fan: {exc}', file=sys.stderr)
+        sys.exit(1)
